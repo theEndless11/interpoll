@@ -29,7 +29,6 @@ const oauthStates = new Map(); // state -> provider
 const sessions = new Map(); // sessionId -> user
 
 // FIXED: Support both development and production origins
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 // FIXED: Production base URL for OAuth redirects
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
@@ -153,16 +152,26 @@ function decodeJwt(token) {
 }
 
 // FIXED: Proper CORS handling with allowed origins list
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
+// Allow any origin dynamically
+const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',')
-  : [FRONTEND_ORIGIN];
+  : ['*'];
+
 
 server.on('request', (req, res) => {
-  // FIXED: Proper CORS for multiple origins with credentials
-  const origin = req.headers.origin || '';
-  if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  // Proper CORS handling (supports "*" with credentials correctly)
+  const origin = req.headers.origin;
+
+  if (allowedOrigins.includes('*')) {
+    // Reflect origin dynamically (required when using credentials)
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+  } else if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
   }
+
+  res.setHeader('Vary', 'Origin'); // Important for proxies/CDNs
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -180,6 +189,7 @@ server.on('request', (req, res) => {
   }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
 
   // ─────────────────────────────────────────────────────────────
   // OAuth: Google
