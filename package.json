@@ -1,0 +1,25 @@
+{
+  "name": "p2p-relay-server",
+  "version": "1.0.0",
+  "description": "WebSocket relay server for cross-device P2P sync with OAuth support",
+  "type": "module",
+  "main": "relay-server.js",
+  "scripts": {
+    "start": "node relay-server.js",
+    "dev": "node relay-server.js"
+  },
+  "keywords": [
+    "websocket",
+    "p2p",
+    "relay",
+    "oauth"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
