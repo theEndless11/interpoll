@@ -16,16 +16,11 @@ const clients = new Map();   // peerId -> WebSocket
 const rooms = new Map();     // roomId -> Set of peerIds
 
 // ─── Persistence ────────────────────────────────────────────────────────────
-// FIX: voteRegistry and sessions were in-memory only — reset on every server
-// restart, allowing users to vote again and losing all login sessions.
-// Now persisted to JSON files so they survive restarts.
-
 const DATA_DIR = new URL('./data', import.meta.url).pathname;
 const VOTE_FILE = `${DATA_DIR}/votes.json`;
 const SESSION_FILE = `${DATA_DIR}/sessions.json`;
 const RECEIPT_LOG_FILE = `${DATA_DIR}/storage.txt`;
 
-// Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function loadJson(file, fallback) {
@@ -40,12 +35,9 @@ function saveJson(file, data) {
   catch (e) { console.error(`Failed to save ${file}:`, e); }
 }
 
-// Load persisted vote registry (Set stored as Array in JSON)
 const voteRegistryData = loadJson(VOTE_FILE, []);
 const voteRegistry = new Set(voteRegistryData);
 
-// Load persisted sessions (Map stored as Object in JSON)
-// FIX: Also enforce session expiry — sessions older than 7 days are dropped
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const rawSessions = loadJson(SESSION_FILE, {});
 const sessions = new Map();
@@ -55,7 +47,6 @@ for (const [id, entry] of Object.entries(rawSessions)) {
     sessions.set(id, entry);
   }
 }
-// Persist cleaned sessions immediately
 saveJson(SESSION_FILE, Object.fromEntries(sessions));
 
 function persistVotes() {
@@ -76,7 +67,6 @@ console.log('Google OAuth config:', {
   clientSecretConfigured: !!process.env.GOOGLE_CLIENT_SECRET,
 });
 
-// Minimal in-memory OAuth state (short-lived, ok to lose on restart)
 const oauthStates = new Map();
 
 function generateRandomId(bytes = 16) {
@@ -89,11 +79,8 @@ function setSessionCookie(res, user) {
   sessions.set(sessionId, { ...user, expiresAt });
   persistSessions();
   const maxAge = Math.floor(SESSION_TTL_MS / 1000);
-  // SameSite=None;Secure required for cross-origin cookie on Render
   const cookie = `sessionId=${sessionId}; HttpOnly; Path=/; SameSite=None; Secure; Max-Age=${maxAge}`;
   res.setHeader('Set-Cookie', cookie);
-  // Return sessionId so callers can also embed it in the redirect URL
-  // (fallback for browsers that block third-party cookies)
   return sessionId;
 }
 
@@ -107,7 +94,6 @@ function getSessionFromRequest(req) {
   if (!sessionId) return null;
   const entry = sessions.get(sessionId);
   if (!entry) return null;
-  // FIX: Check expiry
   if (entry.expiresAt && entry.expiresAt < Date.now()) {
     sessions.delete(sessionId);
     persistSessions();
@@ -173,7 +159,6 @@ function decodeJwt(token) {
 // ─── HTTP routes ──────────────────────────────────────────────────────────────
 
 server.on('request', (req, res) => {
-  // Wildcard CORS — allow any origin for Render deployment
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -307,8 +292,6 @@ server.on('request', (req, res) => {
   // ── Session / Me ──────────────────────────────────────────────────────────
 
   if (req.method === 'GET' && url.pathname === '/api/me') {
-    // Accept sessionId from cookie, Authorization header, or query param
-    // (query param / header used when wildcard CORS blocks cookies)
     let user = getSessionFromRequest(req);
     if (!user) {
       const authHeader = req.headers['authorization'] || '';
@@ -365,7 +348,7 @@ server.on('request', (req, res) => {
         const alreadyVoted = voteRegistry.has(key);
         if (!alreadyVoted) {
           voteRegistry.add(key);
-          persistVotes(); // FIX: persist immediately so restarts don't allow re-voting
+          persistVotes();
         }
         const logEntry = { type: 'vote-authorize', pollId, deviceId, allowed: !alreadyVoted, timestamp: Date.now() };
         fs.appendFile(RECEIPT_LOG_FILE, JSON.stringify(logEntry) + '\n', () => {});
@@ -405,47 +388,81 @@ server.on('request', (req, res) => {
   res.end('Not found');
 });
 
-// ─── WebSocket ────────────────────────────────────────────────────────────────
+// ─── WebSocket + Native Keepalive ────────────────────────────────────────────
+// Send a protocol-level ping every 20s. If a client hasn't responded (pong)
+// by the next tick it's considered dead and terminated. This prevents proxies
+// (Render, Railway, Cloudflare, etc.) from killing idle connections at ~30s.
 
-wss.on('connection', (ws, req) => {
+const PING_INTERVAL = 20_000;
+
+const pingTimer = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      return;
+    }
+    ws.isAlive = false;
+    ws.ping(); // native WebSocket ping frame — browser/ws clients auto-pong
+  });
+}, PING_INTERVAL);
+
+wss.on('close', () => clearInterval(pingTimer));
+
+wss.on('connection', (ws) => {
   let peerId = null;
-  console.log('🔌 New connection from', req.socket.remoteAddress);
+  ws.isAlive = true;
+
+  // Reset alive flag whenever the client sends a native pong
+  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message.toString());
       switch (data.type) {
+
         case 'register':
           peerId = data.peerId;
           clients.set(peerId, ws);
-          console.log(`✅ Peer registered: ${peerId} (Total: ${clients.size})`);
+          console.log(`✅ Peer registered: ${peerId} (total: ${clients.size})`);
           broadcast({ type: 'peer-list', peers: Array.from(clients.keys()) });
           break;
-        case 'join-room':
+
+        case 'join-room': {
           const roomId = data.roomId || 'default';
           if (!rooms.has(roomId)) rooms.set(roomId, new Set());
           rooms.get(roomId).add(peerId);
-          console.log(`🚪 ${peerId} joined room: ${roomId}`);
+          // No log — this fires on every reconnect and spams the console
           break;
+        }
+
         case 'broadcast':
-          console.log(`📡 Broadcasting ${data.data?.type || 'message'} from ${peerId}`);
           broadcastToOthers(peerId, data.data);
           break;
-        case 'direct':
+
+        case 'direct': {
           const targetWs = clients.get(data.targetPeer);
           if (targetWs?.readyState === 1) targetWs.send(JSON.stringify(data.data));
           break;
+        }
+
         case 'new-poll':
         case 'new-block':
         case 'request-sync':
         case 'sync-response':
-          console.log(`📡 Broadcasting ${data.type} from ${peerId}`);
           broadcastToOthers(peerId, data);
           break;
+
+        case 'ping':
+          // JSON-level ping from the client — reply so it knows we're alive.
+          // Real keepalive is handled by native ws.ping() above.
+          if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'pong' }));
+          break;
+
         default:
-          console.log('Unknown message type:', data.type);
+          // Silently ignore unknown message types — no log spam
+          break;
       }
-    } catch (error) { console.error('Error handling message:', error); }
+    } catch (error) { console.error('WS message error:', error); }
   });
 
   ws.on('close', () => {
@@ -455,7 +472,7 @@ wss.on('connection', (ws, req) => {
         peers.delete(peerId);
         if (peers.size === 0) rooms.delete(roomId);
       });
-      console.log(`❌ Peer disconnected: ${peerId} (Total: ${clients.size})`);
+      console.log(`❌ Peer disconnected: ${peerId} (total: ${clients.size})`);
       broadcast({ type: 'peer-left', peerId });
     }
   });
@@ -464,6 +481,8 @@ wss.on('connection', (ws, req) => {
 
   ws.send(JSON.stringify({ type: 'welcome', message: 'Connected to P2P relay', timestamp: Date.now() }));
 });
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function broadcast(message) {
   clients.forEach((ws) => {
@@ -477,6 +496,8 @@ function broadcastToOthers(excludePeerId, message) {
   });
 }
 
+// ─── Start ────────────────────────────────────────────────────────────────────
+
 server.listen(PORT, () => {
   console.log(`🚀 P2P Relay Server running on ws://localhost:${PORT}`);
   console.log(`📦 Persisted votes loaded: ${voteRegistry.size}`);
@@ -484,7 +505,7 @@ server.listen(PORT, () => {
 });
 
 // ─── Periodic session cleanup ─────────────────────────────────────────────────
-// Prune expired sessions every hour to prevent unbounded growth
+
 setInterval(() => {
   const now = Date.now();
   let pruned = 0;
@@ -498,6 +519,7 @@ process.on('SIGINT', () => {
   console.log('\n👋 Shutting down...');
   persistVotes();
   persistSessions();
+  clearInterval(pingTimer);
   wss.clients.forEach((ws) => ws.close());
   server.close(() => { console.log('✅ Server closed'); process.exit(0); });
 });
