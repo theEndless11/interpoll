@@ -17,6 +17,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "gun": "^0.2020.1240",
     "ws": "^8.18.0"
   },
   "engines": {
