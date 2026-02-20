@@ -78,18 +78,26 @@ function escapeHtml(text) {
 async function fetchPostFromGun(postId) {
   return new Promise((resolve) => {
     let resolved = false;
+
+    // Try flat path first, then community path
     gun.get('posts').get(postId).once((data) => {
       if (resolved) return;
-      resolved = true;
-      if (!data?.id || !data?.title) { resolve(null); return; }
-      resolve({
-        id: data.id, communityId: data.communityId || '',
-        authorName: data.authorName || 'Anonymous',
-        title: data.title, content: data.content || '',
-        imageIPFS: data.imageIPFS || '', createdAt: data.createdAt || Date.now(),
-      });
+      if (data?.id && data?.title) {
+        resolved = true;
+        resolve({ id: data.id, authorName: data.authorName || 'Anonymous', title: data.title, content: data.content || '', imageIPFS: data.imageIPFS || '', createdAt: data.createdAt || Date.now() });
+      }
     });
-    setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, 3000);
+
+    // Also search community posts
+    gun.get('posts').map().once((data) => {
+      if (resolved) return;
+      if (data?.id === postId && data?.title) {
+        resolved = true;
+        resolve({ id: data.id, authorName: data.authorName || 'Anonymous', title: data.title, content: data.content || '', imageIPFS: data.imageIPFS || '', createdAt: data.createdAt || Date.now() });
+      }
+    });
+
+    setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, 4000);
   });
 }
 
