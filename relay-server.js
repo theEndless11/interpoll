@@ -9,11 +9,10 @@ import https from 'https';
 import fs from 'fs';
 import crypto from 'crypto';
 import { URL } from 'url';
-import Gun from 'gun';
 
 const PORT = process.env.PORT || 8080;
 const DOMAIN = process.env.DOMAIN || 'https://endless.sbs';
-const GUN_URL = process.env.GUN_URL || 'https://interpoll2.onrender.com/gun';
+const GUN_DB_URL = process.env.GUN_DB_URL || 'https://interpoll2.onrender.com';
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'https://endless.sbs';
 
 const server = http.createServer();
@@ -54,18 +53,59 @@ function saveMessageCache() {
 }
 setInterval(saveMessageCache, 30_000);
 
-// ─── GunDB (for SSR data fetching) ───────────────────────────────────────────
-const gunHttpServer = http.createServer();
-const gun = Gun({
-  peers: [GUN_URL],
-  web: gunHttpServer,
-  radisk: false,
-  localStorage: false,
-});
-
 // ─── SSR Cache ────────────────────────────────────────────────────────────────
 const ssrCache = new Map();
 const SSR_CACHE_TTL = 3_600_000; // 1 hour
+
+// ─── Direct MySQL REST helpers (via gun-relay /db/* endpoints) ────────────────
+
+function dbGet(path) {
+  return new Promise((resolve) => {
+    const url = `${GUN_DB_URL}${path}`;
+    const mod = url.startsWith('https') ? https : http;
+    mod.get(url, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          resolve(res.statusCode === 200 ? json : null);
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
+
+async function fetchPostFromDB(postId) {
+  // Use the dedicated find-post endpoint — searches all community paths + flat path
+  const result = await dbGet(`/db/find-post?postId=${encodeURIComponent(postId)}`);
+  if (!result?.data?.title) return null;
+  const d = result.data;
+  return {
+    id: d.id || postId,
+    authorName: d.authorName || 'Anonymous',
+    title: d.title,
+    content: d.content || '',
+    imageIPFS: d.imageIPFS || '',
+    createdAt: d.createdAt || Date.now(),
+  };
+}
+
+async function fetchPollFromDB(pollId) {
+  // Use the dedicated find-poll endpoint — searches all community paths + flat path
+  const result = await dbGet(`/db/find-poll?pollId=${encodeURIComponent(pollId)}`);
+  if (!result?.data?.question) return null;
+  const d = result.data;
+  return {
+    id: d.id || pollId,
+    communityId: d.communityId || '',
+    authorName: d.authorName || 'Anonymous',
+    question: d.question,
+    description: d.description || '',
+    totalVotes: d.totalVotes || 0,
+    createdAt: d.createdAt || Date.now(),
+  };
+}
 
 // ─── SSR Helpers ──────────────────────────────────────────────────────────────
 function escapeHtml(text) {
@@ -75,55 +115,54 @@ function escapeHtml(text) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
-async function fetchPostFromGun(postId) {
-  return new Promise((resolve) => {
-    let resolved = false;
+async function generateSitemap() {
+  try {
+    // Fetch all posts and polls via search endpoint
+    const [postsResult, pollsResult] = await Promise.all([
+      dbGet('/db/search?prefix=communities/'),
+      dbGet('/db/search?prefix=polls/'),
+    ]);
 
-    // Try flat path first, then community path
-    gun.get('posts').get(postId).once((data) => {
-      if (resolved) return;
-      if (data?.id && data?.title) {
-        resolved = true;
-        resolve({ id: data.id, authorName: data.authorName || 'Anonymous', title: data.title, content: data.content || '', imageIPFS: data.imageIPFS || '', createdAt: data.createdAt || Date.now() });
+    const posts = [];
+    const polls = [];
+    const seenIds = new Set();
+
+    if (postsResult?.results) {
+      for (const row of postsResult.results) {
+        // Only include souls that look like post souls
+        if (!row.soul.includes('/posts/post-')) continue;
+        const d = row.data;
+        if (d?.id && !seenIds.has(d.id)) {
+          seenIds.add(d.id);
+          posts.push({ id: d.id, createdAt: d.createdAt || Date.now() });
+        }
       }
-    });
+    }
 
-    // Also search community posts
-    gun.get('posts').map().once((data) => {
-      if (resolved) return;
-      if (data?.id === postId && data?.title) {
-        resolved = true;
-        resolve({ id: data.id, authorName: data.authorName || 'Anonymous', title: data.title, content: data.content || '', imageIPFS: data.imageIPFS || '', createdAt: data.createdAt || Date.now() });
+    if (pollsResult?.results) {
+      for (const row of pollsResult.results) {
+        const d = row.data;
+        if (d?.id && d?.question && !seenIds.has(d.id)) {
+          seenIds.add(d.id);
+          polls.push({ id: d.id, createdAt: d.createdAt || Date.now() });
+        }
       }
-    });
+    }
 
-    setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, 4000);
-  });
-}
-
-async function fetchPollFromGun(pollId) {
-  return new Promise((resolve) => {
-    let resolved = false;
-    gun.get('polls').get(pollId).once((data) => {
-      if (resolved) return;
-      resolved = true;
-      if (!data?.id || !data?.question) { resolve(null); return; }
-      resolve({
-        id: data.id, communityId: data.communityId || '',
-        authorName: data.authorName || 'Anonymous',
-        question: data.question, description: data.description || '',
-        totalVotes: data.totalVotes || 0, createdAt: data.createdAt || Date.now(),
-      });
-    });
-    setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, 3000);
-  });
+    let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
+    xml += `  <url><loc>${DOMAIN}/</loc><changefreq>hourly</changefreq></url>\n`;
+    for (const p of posts)
+      xml += `  <url><loc>${DOMAIN}/post/${p.id}</loc><lastmod>${new Date(p.createdAt).toISOString().split('T')[0]}</lastmod><changefreq>weekly</changefreq></url>\n`;
+    for (const p of polls)
+      xml += `  <url><loc>${DOMAIN}/vote/${p.id}</loc><lastmod>${new Date(p.createdAt).toISOString().split('T')[0]}</lastmod><changefreq>weekly</changefreq></url>\n`;
+    xml += '</urlset>';
+    return xml;
+  } catch {
+    return '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>';
+  }
 }
 
 // ─── SSR HTML Generators ──────────────────────────────────────────────────────
-// ⚠️  After each `npm run build`, update ASSET_JS and ASSET_CSS env vars
-// on Render with the new hashed filenames from your dist/assets2/ folder.
-// e.g. ASSET_JS=/assets2/index-BYrGb0OJ.js  ASSET_CSS=/assets2/index-0YYtVvAj.css
-
 function buildHtmlShell(head, initScript = '') {
   const ASSET_JS = process.env.ASSET_JS || '/assets2/index.js';
   const ASSET_CSS = process.env.ASSET_CSS || '/assets2/index.css';
@@ -184,30 +223,6 @@ function generatePollHTML(poll) {
     <link rel="canonical" href="${pollUrl}" />
     <script type="application/ld+json">{"@context":"https://schema.org","@type":"CreativeWork","name":"${question}","description":"${desc}","author":{"@type":"Person","name":"${escapeHtml(poll.authorName)}"},"datePublished":"${new Date(poll.createdAt).toISOString()}"}</script>`;
   return buildHtmlShell(head, `<script>window.__INITIAL_POLL_ID__="${escapeHtml(poll.id)}";</script>`);
-}
-
-async function generateSitemap() {
-  try {
-    const collect = (node) => new Promise((resolve) => {
-      const items = [];
-      node.map().once((data, key) => {
-        if (data?.id && !key.startsWith('_'))
-          items.push({ id: data.id, createdAt: data.createdAt || Date.now() });
-      });
-      setTimeout(() => resolve(items), 1500);
-    });
-    const [posts, polls] = await Promise.all([collect(gun.get('posts')), collect(gun.get('polls'))]);
-    let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
-    xml += `  <url><loc>${DOMAIN}/</loc><changefreq>hourly</changefreq></url>\n`;
-    for (const p of posts)
-      xml += `  <url><loc>${DOMAIN}/post/${p.id}</loc><lastmod>${new Date(p.createdAt).toISOString().split('T')[0]}</lastmod><changefreq>weekly</changefreq></url>\n`;
-    for (const p of polls)
-      xml += `  <url><loc>${DOMAIN}/vote/${p.id}</loc><lastmod>${new Date(p.createdAt).toISOString().split('T')[0]}</lastmod><changefreq>weekly</changefreq></url>\n`;
-    xml += '</urlset>';
-    return xml;
-  } catch {
-    return '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>';
-  }
 }
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
@@ -284,7 +299,7 @@ server.on('request', async (req, res) => {
       res.setHeader('Cache-Control', 'public, max-age=3600');
       res.end(cached.html); return;
     }
-    const post = await fetchPostFromGun(postId);
+    const post = await fetchPostFromDB(postId);
     if (!post) { res.writeHead(404); res.end('Post not found'); return; }
     const html = generatePostHTML(post);
     ssrCache.set(`post:${postId}`, { html, ts: Date.now() });
@@ -303,7 +318,7 @@ server.on('request', async (req, res) => {
       res.setHeader('Cache-Control', 'public, max-age=3600');
       res.end(cached.html); return;
     }
-    const poll = await fetchPollFromGun(pollId);
+    const poll = await fetchPollFromDB(pollId);
     if (!poll) { res.writeHead(404); res.end('Poll not found'); return; }
     const html = generatePollHTML(poll);
     ssrCache.set(`poll:${pollId}`, { html, ts: Date.now() });
@@ -582,6 +597,7 @@ server.listen(PORT, () => {
   console.log('');
   console.log(`🌐 Port      : ${PORT}`);
   console.log(`📡 Domain    : ${DOMAIN}`);
+  console.log(`🗄️  DB URL    : ${GUN_DB_URL}`);
   console.log(`🔍 Sitemap   : ${DOMAIN}/sitemap.xml`);
   console.log(`💬 Msg cache : ${messageCache.length} messages`);
   console.log('');
