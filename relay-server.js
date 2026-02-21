@@ -1,59 +1,13 @@
-// relay-server.js
-// WebSocket relay + SSR for bots (Googlebot, social media crawlers)
-// Real users are served by Hostinger (fast static SPA)
-// Bots are detected by Cloudflare Worker and routed here for SSR HTML
-
 import { WebSocketServer } from 'ws';
 import http from 'http';
 import https from 'https';
 import fs from 'fs';
 import crypto from 'crypto';
 import { URL } from 'url';
-import Gun from 'gun';
 import mysql from 'mysql2/promise';
 
 const PORT = process.env.PORT || 8080;
 const DOMAIN = process.env.DOMAIN || 'https://endless.sbs';
-const GUN_URL = process.env.GUN_URL || 'https://interpoll2.onrender.com/gun';
-
-// ─── MySQL (shared with gun-relay, for direct SSR queries) ────────────────────
-let db = null;
-async function initMySQL() {
-  if (!process.env.MYSQL_HOST) return;
-  try {
-    db = await mysql.createPool({
-      host: process.env.MYSQL_HOST,
-      user: process.env.MYSQL_USER,
-      password: process.env.MYSQL_PASSWORD,
-      database: process.env.MYSQL_DATABASE,
-      port: process.env.MYSQL_PORT ? parseInt(process.env.MYSQL_PORT) : 3306,
-      waitForConnections: true,
-      connectionLimit: 5,
-      ssl: { rejectUnauthorized: false },
-    });
-    console.log('✅ MySQL connected (SSR)');
-  } catch (err) {
-    console.error('❌ MySQL connection failed:', err.message);
-    db = null;
-  }
-}
-await initMySQL();
-
-async function fetchFromMySQL(soul) {
-  if (!db) return null;
-  let conn;
-  try {
-    conn = await db.getConnection();
-    const [rows] = await conn.execute('SELECT data FROM gun_nodes WHERE soul = ?', [soul]);
-    if (rows.length === 0) return null;
-    return JSON.parse(rows[0].data);
-  } catch (err) {
-    console.error('❌ MySQL fetch error:', err.message);
-    return null;
-  } finally {
-    if (conn) conn.release();
-  }
-}
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'https://endless.sbs';
 
 const server = http.createServer();
@@ -76,7 +30,6 @@ let messageCache = [];
 try {
   if (fs.existsSync(MESSAGE_CACHE_FILE)) {
     messageCache = JSON.parse(fs.readFileSync(MESSAGE_CACHE_FILE, 'utf8'));
-    console.log(`✅ Loaded ${messageCache.length} cached messages`);
   }
 } catch { messageCache = []; }
 
@@ -94,93 +47,97 @@ function saveMessageCache() {
 }
 setInterval(saveMessageCache, 30_000);
 
-// ─── GunDB (for SSR data fetching) ───────────────────────────────────────────
-const gunHttpServer = http.createServer();
-const gun = Gun({
-  peers: [GUN_URL],
-  web: gunHttpServer,
-  radisk: false,
-  localStorage: false,
-});
+// ─── MySQL ────────────────────────────────────────────────────────────────────
+let db = null;
+
+async function initMySQL() {
+  if (!process.env.MYSQL_HOST) return;
+  try {
+    db = await mysql.createPool({
+      host: process.env.MYSQL_HOST,
+      user: process.env.MYSQL_USER,
+      password: process.env.MYSQL_PASSWORD,
+      database: process.env.MYSQL_DATABASE,
+      port: process.env.MYSQL_PORT ? parseInt(process.env.MYSQL_PORT) : 3306,
+      waitForConnections: true,
+      connectionLimit: 5,
+      ssl: { rejectUnauthorized: false },
+    });
+    console.log('✅ MySQL connected');
+  } catch (err) {
+    console.error('❌ MySQL failed:', err.message);
+    db = null;
+  }
+}
+await initMySQL();
+
+async function queryMySQL(sql, params) {
+  if (!db) return null;
+  let conn;
+  try {
+    conn = await db.getConnection();
+    const [rows] = await conn.execute(sql, params);
+    return rows;
+  } catch (err) {
+    console.error('❌ MySQL query error:', err.message);
+    return null;
+  } finally {
+    if (conn) conn.release();
+  }
+}
 
 // ─── SSR Cache ────────────────────────────────────────────────────────────────
 const ssrCache = new Map();
-const SSR_CACHE_TTL = 3_600_000; // 1 hour
+const SSR_CACHE_TTL = 3_600_000;
+
+// ─── SSR Data Fetching ────────────────────────────────────────────────────────
+async function fetchPostFromDB(postId) {
+  const escaped = postId.replace(/[%_\\]/g, '\\$&');
+  const rows = await queryMySQL(
+    `SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? OR soul = ? LIMIT 10`,
+    [`%/posts/${escaped}`, '\\', `posts/${postId}`]
+  );
+  if (!rows) return null;
+  for (const row of rows) {
+    try {
+      const d = JSON.parse(row.data);
+      if (d?.title) return {
+        id: d.id || postId, authorName: d.authorName || 'Anonymous',
+        title: d.title, content: d.content || '',
+        imageIPFS: d.imageIPFS || '', createdAt: d.createdAt || Date.now(),
+      };
+    } catch { /* skip */ }
+  }
+  return null;
+}
+
+async function fetchPollFromDB(pollId) {
+  const escaped = pollId.replace(/[%_\\]/g, '\\$&');
+  const rows = await queryMySQL(
+    `SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? OR soul = ? LIMIT 10`,
+    [`%/polls/${escaped}`, '\\', `polls/${pollId}`]
+  );
+  if (!rows) return null;
+  for (const row of rows) {
+    try {
+      const d = JSON.parse(row.data);
+      if (d?.question) return {
+        id: d.id || pollId, authorName: d.authorName || 'Anonymous',
+        question: d.question, description: d.description || '',
+        totalVotes: d.totalVotes || 0, createdAt: d.createdAt || Date.now(),
+      };
+    } catch { /* skip */ }
+  }
+  return null;
+}
 
 // ─── SSR Helpers ──────────────────────────────────────────────────────────────
-function escapeHtml(text) {
-  if (!text) return '';
-  return String(text)
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
-
-async function fetchPostFromGun(postId) {
-  // Try MySQL first (fast, reliable)
-  const data = await fetchFromMySQL(`posts/${postId}`);
-  if (data?.title) {
-    return {
-      id: data.id || postId,
-      authorName: data.authorName || 'Anonymous',
-      title: data.title,
-      content: data.content || '',
-      imageIPFS: data.imageIPFS || '',
-      createdAt: data.createdAt || Date.now(),
-    };
-  }
-  // Fallback to Gun (slower, requires active peer)
-  return new Promise((resolve) => {
-    let resolved = false;
-    gun.get('posts').get(postId).once((data) => {
-      if (resolved) return;
-      resolved = true;
-      if (!data?.title) { resolve(null); return; }
-      resolve({
-        id: data.id || postId,
-        authorName: data.authorName || 'Anonymous',
-        title: data.title, content: data.content || '',
-        imageIPFS: data.imageIPFS || '', createdAt: data.createdAt || Date.now(),
-      });
-    });
-    setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, 3000);
-  });
-}
-
-async function fetchPollFromGun(pollId) {
-  // Try MySQL first
-  const data = await fetchFromMySQL(`polls/${pollId}`);
-  if (data?.question) {
-    return {
-      id: data.id || pollId,
-      authorName: data.authorName || 'Anonymous',
-      question: data.question,
-      description: data.description || '',
-      totalVotes: data.totalVotes || 0,
-      createdAt: data.createdAt || Date.now(),
-    };
-  }
-  // Fallback to Gun
-  return new Promise((resolve) => {
-    let resolved = false;
-    gun.get('polls').get(pollId).once((data) => {
-      if (resolved) return;
-      resolved = true;
-      if (!data?.question) { resolve(null); return; }
-      resolve({
-        id: data.id || pollId,
-        authorName: data.authorName || 'Anonymous',
-        question: data.question, description: data.description || '',
-        totalVotes: data.totalVotes || 0, createdAt: data.createdAt || Date.now(),
-      });
-    });
-    setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, 3000);
-  });
-}
-
-// ─── SSR HTML Generators ──────────────────────────────────────────────────────
-// ⚠️  After each `npm run build`, update ASSET_JS and ASSET_CSS env vars
-// on Render with the new hashed filenames from your dist/assets2/ folder.
-// e.g. ASSET_JS=/assets2/index-BYrGb0OJ.js  ASSET_CSS=/assets2/index-0YYtVvAj.css
 
 function buildHtmlShell(head, initScript = '') {
   const ASSET_JS = process.env.ASSET_JS || '/assets2/index.js';
@@ -206,7 +163,7 @@ function generatePostHTML(post) {
   const title = escapeHtml(post.title);
   const imageUrl = post.imageIPFS ? `https://ipfs.io/ipfs/${post.imageIPFS}` : `${DOMAIN}/og-default.png`;
   const postUrl = `${DOMAIN}/post/${post.id}`;
-  const head = `
+  return buildHtmlShell(`
     <title>${title} - Interpoll</title>
     <meta name="description" content="${desc}" />
     <meta property="og:type" content="article" />
@@ -220,15 +177,16 @@ function generatePostHTML(post) {
     <meta name="twitter:description" content="${desc}" />
     <meta name="twitter:image" content="${imageUrl}" />
     <link rel="canonical" href="${postUrl}" />
-    <script type="application/ld+json">{"@context":"https://schema.org","@type":"BlogPosting","headline":"${title}","description":"${desc}","image":"${imageUrl}","author":{"@type":"Person","name":"${escapeHtml(post.authorName)}"},"datePublished":"${new Date(post.createdAt).toISOString()}"}</script>`;
-  return buildHtmlShell(head, `<script>window.__INITIAL_POST_ID__="${escapeHtml(post.id)}";</script>`);
+    <script type="application/ld+json">{"@context":"https://schema.org","@type":"BlogPosting","headline":"${title}","description":"${desc}","image":"${imageUrl}","author":{"@type":"Person","name":"${escapeHtml(post.authorName)}"},"datePublished":"${new Date(post.createdAt).toISOString()}"}</script>`,
+    `<script>window.__INITIAL_POST_ID__="${escapeHtml(post.id)}";</script>`
+  );
 }
 
 function generatePollHTML(poll) {
   const desc = escapeHtml((poll.description || `Vote on: ${poll.question}`).slice(0, 160));
   const question = escapeHtml(poll.question);
   const pollUrl = `${DOMAIN}/vote/${poll.id}`;
-  const head = `
+  return buildHtmlShell(`
     <title>${question} - Interpoll</title>
     <meta name="description" content="${desc}" />
     <meta property="og:type" content="website" />
@@ -240,29 +198,34 @@ function generatePollHTML(poll) {
     <meta name="twitter:title" content="${question}" />
     <meta name="twitter:description" content="${desc}" />
     <link rel="canonical" href="${pollUrl}" />
-    <script type="application/ld+json">{"@context":"https://schema.org","@type":"CreativeWork","name":"${question}","description":"${desc}","author":{"@type":"Person","name":"${escapeHtml(poll.authorName)}"},"datePublished":"${new Date(poll.createdAt).toISOString()}"}</script>`;
-  return buildHtmlShell(head, `<script>window.__INITIAL_POLL_ID__="${escapeHtml(poll.id)}";</script>`);
+    <script type="application/ld+json">{"@context":"https://schema.org","@type":"CreativeWork","name":"${question}","description":"${desc}","author":{"@type":"Person","name":"${escapeHtml(poll.authorName)}"},"datePublished":"${new Date(poll.createdAt).toISOString()}"}</script>`,
+    `<script>window.__INITIAL_POLL_ID__="${escapeHtml(poll.id)}";</script>`
+  );
 }
 
 async function generateSitemap() {
   try {
-    const collect = (node) => new Promise((resolve) => {
-      const items = [];
-      node.map().once((data, key) => {
-        if (data?.id && !key.startsWith('_'))
-          items.push({ id: data.id, createdAt: data.createdAt || Date.now() });
-      });
-      setTimeout(() => resolve(items), 1500);
-    });
-    const [posts, polls] = await Promise.all([collect(gun.get('posts')), collect(gun.get('polls'))]);
+    const rows = await queryMySQL(
+      `SELECT soul, data FROM gun_nodes WHERE soul LIKE 'communities/%/posts/post-%' OR soul LIKE 'polls/poll-%'`,
+      []
+    );
+    const posts = [], polls = [], seen = new Set();
+    for (const row of rows || []) {
+      try {
+        const d = JSON.parse(row.data);
+        if (!d?.id || seen.has(d.id)) continue;
+        seen.add(d.id);
+        if (row.soul.includes('/posts/')) posts.push({ id: d.id, createdAt: d.createdAt || Date.now() });
+        else if (d.question) polls.push({ id: d.id, createdAt: d.createdAt || Date.now() });
+      } catch { /* skip */ }
+    }
     let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
     xml += `  <url><loc>${DOMAIN}/</loc><changefreq>hourly</changefreq></url>\n`;
     for (const p of posts)
       xml += `  <url><loc>${DOMAIN}/post/${p.id}</loc><lastmod>${new Date(p.createdAt).toISOString().split('T')[0]}</lastmod><changefreq>weekly</changefreq></url>\n`;
     for (const p of polls)
       xml += `  <url><loc>${DOMAIN}/vote/${p.id}</loc><lastmod>${new Date(p.createdAt).toISOString().split('T')[0]}</lastmod><changefreq>weekly</changefreq></url>\n`;
-    xml += '</urlset>';
-    return xml;
+    return xml + '</urlset>';
   } catch {
     return '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>';
   }
@@ -332,7 +295,7 @@ server.on('request', async (req, res) => {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  // ── SSR: Post page ────────────────────────────────────────────────────────
+  // ── SSR: Post ─────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname.startsWith('/post/')) {
     const postId = url.pathname.split('/')[2];
     if (!postId) { res.writeHead(404); res.end('Not found'); return; }
@@ -342,7 +305,7 @@ server.on('request', async (req, res) => {
       res.setHeader('Cache-Control', 'public, max-age=3600');
       res.end(cached.html); return;
     }
-    const post = await fetchPostFromGun(postId);
+    const post = await fetchPostFromDB(postId);
     if (!post) { res.writeHead(404); res.end('Post not found'); return; }
     const html = generatePostHTML(post);
     ssrCache.set(`post:${postId}`, { html, ts: Date.now() });
@@ -351,7 +314,7 @@ server.on('request', async (req, res) => {
     res.end(html); return;
   }
 
-  // ── SSR: Poll page ────────────────────────────────────────────────────────
+  // ── SSR: Poll ─────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname.startsWith('/vote/')) {
     const pollId = url.pathname.split('/')[2];
     if (!pollId) { res.writeHead(404); res.end('Not found'); return; }
@@ -361,7 +324,7 @@ server.on('request', async (req, res) => {
       res.setHeader('Cache-Control', 'public, max-age=3600');
       res.end(cached.html); return;
     }
-    const poll = await fetchPollFromGun(pollId);
+    const poll = await fetchPollFromDB(pollId);
     if (!poll) { res.writeHead(404); res.end('Poll not found'); return; }
     const html = generatePollHTML(poll);
     ssrCache.set(`poll:${pollId}`, { html, ts: Date.now() });
@@ -372,10 +335,9 @@ server.on('request', async (req, res) => {
 
   // ── Sitemap & Robots ──────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/sitemap.xml') {
-    const sitemap = await generateSitemap();
     res.setHeader('Content-Type', 'application/xml');
     res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.end(sitemap); return;
+    res.end(await generateSitemap()); return;
   }
 
   if (req.method === 'GET' && url.pathname === '/robots.txt') {
@@ -384,10 +346,10 @@ server.on('request', async (req, res) => {
     return;
   }
 
-  // ── Health check ──────────────────────────────────────────────────────────
+  // ── Health ────────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', uptime: process.uptime(), clients: clients.size, cachedMessages: messageCache.length }));
+    res.end(JSON.stringify({ status: 'ok', uptime: process.uptime(), clients: clients.size, cachedMessages: messageCache.length, mysql: !!db }));
     return;
   }
 
@@ -549,7 +511,7 @@ server.on('request', async (req, res) => {
   res.end('Not found');
 });
 
-// ─── WebSocket + Keepalive ────────────────────────────────────────────────────
+// ─── WebSocket ────────────────────────────────────────────────────────────────
 const PING_INTERVAL = 20_000;
 const pingTimer = setInterval(() => {
   wss.clients.forEach(ws => {
@@ -573,7 +535,6 @@ wss.on('connection', (ws) => {
         case 'register':
           peerId = data.peerId;
           clients.set(peerId, ws);
-          console.log(`✅ Peer registered: ${peerId} (total: ${clients.size})`);
           broadcast({ type: 'peer-list', peers: Array.from(clients.keys()) });
           for (const msg of messageCache) {
             try { ws.send(JSON.stringify(msg)); } catch { /* ignore */ }
@@ -605,7 +566,7 @@ wss.on('connection', (ws) => {
           if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'pong' }));
           break;
       }
-    } catch (err) { console.error('WS message error:', err); }
+    } catch (err) { console.error('WS error:', err); }
   });
 
   ws.on('close', () => {
@@ -615,7 +576,6 @@ wss.on('connection', (ws) => {
         peers.delete(peerId);
         if (peers.size === 0) rooms.delete(roomId);
       });
-      console.log(`❌ Peer disconnected: ${peerId} (total: ${clients.size})`);
       broadcast({ type: 'peer-left', peerId });
     }
   });
@@ -624,31 +584,21 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'welcome', message: 'Connected to P2P relay', timestamp: Date.now() }));
 });
 
-function broadcast(message) {
-  clients.forEach(ws => { if (ws.readyState === 1) ws.send(JSON.stringify(message)); });
+function broadcast(msg) {
+  clients.forEach(ws => { if (ws.readyState === 1) ws.send(JSON.stringify(msg)); });
 }
-function broadcastToOthers(excludePeerId, message) {
-  clients.forEach((ws, pid) => { if (pid !== excludePeerId && ws.readyState === 1) ws.send(JSON.stringify(message)); });
+function broadcastToOthers(excludeId, msg) {
+  clients.forEach((ws, pid) => { if (pid !== excludeId && ws.readyState === 1) ws.send(JSON.stringify(msg)); });
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log('');
-  console.log('╔════════════════════════════════════════════╗');
-  console.log('║   🚀 Interpoll Relay + SSR Server         ║');
-  console.log('╚════════════════════════════════════════════╝');
-  console.log('');
-  console.log(`🌐 Port      : ${PORT}`);
-  console.log(`📡 Domain    : ${DOMAIN}`);
-  console.log(`🔍 Sitemap   : ${DOMAIN}/sitemap.xml`);
-  console.log(`💬 Msg cache : ${messageCache.length} messages`);
-  console.log('');
+  console.log(`🚀 Relay on :${PORT} | MySQL: ${db ? '✅' : '❌'} | Cache: ${messageCache.length} msgs`);
 });
 
 process.on('SIGINT', () => {
-  console.log('\n👋 Shutting down...');
   saveMessageCache();
   clearInterval(pingTimer);
   wss.clients.forEach(ws => ws.close());
-  server.close(() => { console.log('✅ Server closed'); process.exit(0); });
+  server.close(() => process.exit(0));
 });
