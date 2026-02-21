@@ -8,17 +8,12 @@
     "start": "node relay-server.js",
     "dev": "node relay-server.js"
   },
-  "keywords": [
-    "websocket",
-    "p2p",
-    "relay",
-    "oauth"
-  ],
+  "keywords": ["websocket", "p2p", "relay", "oauth"],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "gun": "^0.2020.1240",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "mysql2": "^3.9.0"
   },
   "engines": {
     "node": ">=18.0.0"
