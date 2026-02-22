@@ -95,7 +95,7 @@ async function fetchPostFromDB(postId) {
   const escaped = postId.replace(/[%_\\]/g, '\\$&');
   const rows = await queryMySQL(
     `SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? OR soul = ? LIMIT 10`,
-    [`%/posts/${escaped}`, '\\', `posts/${postId}`]
+    [`v2/%/posts/${escaped}`, '\\', `v2/posts/${postId}`]
   );
   if (!rows) return null;
   for (const row of rows) {
@@ -115,7 +115,7 @@ async function fetchPollFromDB(pollId) {
   const escaped = pollId.replace(/[%_\\]/g, '\\$&');
   const rows = await queryMySQL(
     `SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? OR soul = ? LIMIT 10`,
-    [`%/polls/${escaped}`, '\\', `polls/${pollId}`]
+    [`v2/%/polls/${escaped}`, '\\', `v2/polls/${pollId}`]
   );
   if (!rows) return null;
   for (const row of rows) {
@@ -206,7 +206,7 @@ function generatePollHTML(poll) {
 async function generateSitemap() {
   try {
     const rows = await queryMySQL(
-      `SELECT soul, data FROM gun_nodes WHERE soul LIKE 'communities/%/posts/post-%' OR soul LIKE 'polls/poll-%'`,
+      `SELECT soul, data FROM gun_nodes WHERE soul LIKE 'v2/communities/%/posts/post-%' OR soul LIKE 'v2/polls/poll-%'`,
       []
     );
     const posts = [], polls = [], seen = new Set();
@@ -593,7 +593,7 @@ function broadcastToOthers(excludeId, msg) {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`🚀 Relay on :${PORT} | MySQL: ${db ? '✅' : '❌'} | Cache: ${messageCache.length} msgs`);
+  console.log(`Relay on :${PORT} | MySQL: ${db ? '✅' : '❌'} | Cache: ${messageCache.length} msgs`);
 });
 
 process.on('SIGINT', () => {
