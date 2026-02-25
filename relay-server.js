@@ -921,20 +921,20 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'chat-message': {
-          const { recipientId, encryptedContent, messageId } = data;
+          const { recipientId, encryptedForRecipient, messageId, timestamp } = data;
           const roomId = getChatRoomId(userId, recipientId);
           
-          const storedId = await storeChatMessage(roomId, userId, recipientId, encryptedContent);
+          const storedId = await storeChatMessage(roomId, userId, recipientId, encryptedForRecipient);
           
           const recipientClient = Array.from(clients.values()).find(c => c.userId === recipientId);
           if (recipientClient?.ws.readyState === 1) {
             recipientClient.ws.send(JSON.stringify({
-              type: 'chat-message',
-              from: userId,
-              messageId: storedId || messageId,
-              encryptedContent,
-              timestamp: Date.now(),
-            }));
+  type: 'chat-message',
+  from: userId,
+  messageId: storedId || messageId,
+  encryptedForRecipient,
+  timestamp: timestamp || Date.now(),
+}));
           }
           
           ws.send(JSON.stringify({
@@ -1067,3 +1067,4 @@ process.on('SIGINT', () => {
   wss.clients.forEach(ws => ws.close());
   server.close(() => process.exit(0));
 });
+
