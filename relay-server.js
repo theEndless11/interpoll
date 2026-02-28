@@ -1,5 +1,5 @@
 //backend/relay-server-enhanced.js
-// Enhanced with: 1-to-1 P2P chat, Full-text search, Improved auth security
+// Enhanced with: 1-to-1 P2P chat, Full-text search, Improved auth security, Bot SSR, Sitemap
 
 import { WebSocketServer } from 'ws';
 import http from 'http';
@@ -69,7 +69,6 @@ async function initMySQL() {
       ssl: { rejectUnauthorized: false },
     });
 
-    // Create search index tables
     await db.execute(`
       CREATE TABLE IF NOT EXISTS search_index (
         id VARCHAR(100) PRIMARY KEY,
@@ -87,7 +86,6 @@ async function initMySQL() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // Chat messages table (encrypted)
     await db.execute(`
       CREATE TABLE IF NOT EXISTS chat_messages (
         id VARCHAR(100) PRIMARY KEY,
@@ -104,7 +102,6 @@ async function initMySQL() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // User profiles
     await db.execute(`
       CREATE TABLE IF NOT EXISTS user_profiles (
         user_id VARCHAR(100) PRIMARY KEY,
@@ -118,7 +115,6 @@ async function initMySQL() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // Session security
     await db.execute(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id VARCHAR(64) PRIMARY KEY,
@@ -156,7 +152,7 @@ async function queryMySQL(sql, params) {
   }
 }
 
-// ─── Search Functions ─────────────────────────────────────────────────────────
+// ─── Search ───────────────────────────────────────────────────────────────────
 async function indexContent(type, id, data) {
   if (!db) return;
   try {
@@ -166,10 +162,8 @@ async function indexContent(type, id, data) {
       `INSERT INTO search_index (id, type, title, content, author, community, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
-         title = VALUES(title),
-         content = VALUES(content),
-         author = VALUES(author),
-         updated_at = NOW()`,
+         title = VALUES(title), content = VALUES(content),
+         author = VALUES(author), updated_at = NOW()`,
       [id, type, title, content || '', data.authorName || 'Anonymous', data.communitySlug || '', data.createdAt || Date.now()]
     );
   } catch (err) {
@@ -180,101 +174,74 @@ async function indexContent(type, id, data) {
 async function searchContent(query, filters = {}) {
   if (!db) return { results: [], total: 0 };
   try {
-    const limit = Math.min(parseInt(filters.limit || '20'), 100);
+    const limit  = Math.min(parseInt(filters.limit  || '20'), 100);
     const offset = parseInt(filters.offset || '0');
-    
-    let sql = `
-      SELECT id, type, title, content, author, community, created_at,
-             MATCH(title, content) AGAINST(? IN NATURAL LANGUAGE MODE) as relevance
-      FROM search_index
-      WHERE MATCH(title, content) AGAINST(? IN NATURAL LANGUAGE MODE)
-    `;
-    const params = [query, query];
 
-    if (filters.type) {
-      sql += ` AND type = ?`;
-      params.push(filters.type);
+    let sql, params, countSql, countParams;
+
+    if (query.length >= 4) {
+      const booleanQuery = query.trim().split(/\s+/).map(w => `+${w}*`).join(' ');
+      sql    = `SELECT id, type, title, content, author, community, created_at,
+                  MATCH(title, content) AGAINST(? IN BOOLEAN MODE) as relevance
+                FROM search_index
+                WHERE MATCH(title, content) AGAINST(? IN BOOLEAN MODE)`;
+      params = [booleanQuery, booleanQuery];
+      countSql    = `SELECT COUNT(*) as total FROM search_index WHERE MATCH(title, content) AGAINST(? IN BOOLEAN MODE)`;
+      countParams = [booleanQuery];
+    } else {
+      const like = `%${query}%`;
+      sql    = `SELECT id, type, title, content, author, community, created_at, 1 as relevance
+                FROM search_index WHERE title LIKE ? OR content LIKE ? OR author LIKE ?`;
+      params = [like, like, like];
+      countSql    = `SELECT COUNT(*) as total FROM search_index WHERE title LIKE ? OR content LIKE ? OR author LIKE ?`;
+      countParams = [like, like, like];
     }
-    if (filters.community) {
-      sql += ` AND community = ?`;
-      params.push(filters.community);
-    }
+
+    if (filters.type)      { sql += ' AND type = ?';      params.push(filters.type);      countSql += ' AND type = ?';      countParams.push(filters.type); }
+    if (filters.community) { sql += ' AND community = ?'; params.push(filters.community); countSql += ' AND community = ?'; countParams.push(filters.community); }
 
     sql += ` ORDER BY relevance DESC, created_at DESC LIMIT ? OFFSET ?`;
     params.push(limit, offset);
 
-    const results = await queryMySQL(sql, params);
-    
-    const countSql = `
-      SELECT COUNT(*) as total FROM search_index
-      WHERE MATCH(title, content) AGAINST(? IN NATURAL LANGUAGE MODE)
-      ${filters.type ? 'AND type = ?' : ''}
-      ${filters.community ? 'AND community = ?' : ''}
-    `;
-    const countParams = [query];
-    if (filters.type) countParams.push(filters.type);
-    if (filters.community) countParams.push(filters.community);
-    
+    const results     = await queryMySQL(sql, params);
     const countResult = await queryMySQL(countSql, countParams);
-    const total = countResult?.[0]?.total || 0;
-
-    return { results: results || [], total };
+    return { results: results || [], total: countResult?.[0]?.total || 0 };
   } catch (err) {
     console.error('❌ Search error:', err.message);
     return { results: [], total: 0 };
   }
 }
 
-// ─── Enhanced Auth & Security ─────────────────────────────────────────────────
+// ─── Auth & Security ──────────────────────────────────────────────────────────
 function generateSecureToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('base64url');
 }
 
 function createJWT(payload, expiresIn = '7d') {
-  const header = { alg: 'HS256', typ: 'JWT' };
-  const exp = Date.now() + (expiresIn === '7d' ? 7 * 24 * 60 * 60 * 1000 : 60 * 60 * 1000);
-  const claims = { ...payload, exp, iat: Date.now() };
-  
-  const encodedHeader = Buffer.from(JSON.stringify(header)).toString('base64url');
-  const encodedPayload = Buffer.from(JSON.stringify(claims)).toString('base64url');
-  const signature = crypto.createHmac('sha256', JWT_SECRET)
-    .update(`${encodedHeader}.${encodedPayload}`)
-    .digest('base64url');
-  
-  return `${encodedHeader}.${encodedPayload}.${signature}`;
+  const header  = { alg: 'HS256', typ: 'JWT' };
+  const exp     = Date.now() + (expiresIn === '7d' ? 7 * 24 * 60 * 60 * 1000 : 60 * 60 * 1000);
+  const claims  = { ...payload, exp, iat: Date.now() };
+  const enc     = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const sig     = crypto.createHmac('sha256', JWT_SECRET).update(`${enc(header)}.${enc(claims)}`).digest('base64url');
+  return `${enc(header)}.${enc(claims)}.${sig}`;
 }
 
 function verifyJWT(token) {
   try {
     const [header, payload, signature] = token.split('.');
-    const validSignature = crypto.createHmac('sha256', JWT_SECRET)
-      .update(`${header}.${payload}`)
-      .digest('base64url');
-    
-    if (signature !== validSignature) return null;
-    
+    const valid = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${payload}`).digest('base64url');
+    if (signature !== valid) return null;
     const claims = JSON.parse(Buffer.from(payload, 'base64url').toString());
     if (claims.exp < Date.now()) return null;
-    
     return claims;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function setSecureSession(res, req, user) {
   const sessionId = generateSecureToken(32);
   const expiresAt = Date.now() + (7 * 24 * 60 * 60 * 1000);
-  
-  const sessionData = {
-    user,
-    ip: req.socket.remoteAddress,
-    userAgent: req.headers['user-agent'],
-    createdAt: Date.now(),
-  };
-  
+  const sessionData = { user, ip: req.socket.remoteAddress, userAgent: req.headers['user-agent'], createdAt: Date.now() };
   sessions.set(sessionId, sessionData);
-  
   if (db) {
     await db.execute(
       `INSERT INTO sessions (session_id, user_id, ip_address, user_agent, created_at, expires_at, last_activity)
@@ -282,47 +249,34 @@ async function setSecureSession(res, req, user) {
       [sessionId, user.sub, sessionData.ip, sessionData.userAgent, Date.now(), expiresAt, Date.now()]
     );
   }
-  
   const jwt = createJWT({ sub: user.sub, email: user.email });
-  
   res.setHeader('Set-Cookie', [
     `sessionId=${sessionId}; HttpOnly; Path=/; SameSite=None; Secure; Max-Age=604800`,
-    `jwt=${jwt}; Path=/; SameSite=None; Secure; Max-Age=604800`
+    `jwt=${jwt}; Path=/; SameSite=None; Secure; Max-Age=604800`,
   ]);
-  
   return { sessionId, jwt };
 }
 
 async function getSecureSession(req) {
   const cookie = req.headers['cookie'] || '';
-  const sid = cookie.split(';').find(c => c.trim().startsWith('sessionId='))?.split('=')[1];
-  const jwt = cookie.split(';').find(c => c.trim().startsWith('jwt='))?.split('=')[1];
-  
+  const sid    = cookie.split(';').find(c => c.trim().startsWith('sessionId='))?.split('=')[1];
+  const jwt    = cookie.split(';').find(c => c.trim().startsWith('jwt='))?.split('=')[1];
   if (jwt) {
     const claims = verifyJWT(jwt);
     if (claims && sid) {
       const sessionData = sessions.get(sid);
       if (sessionData) {
-        if (db) {
-          await db.execute(`UPDATE sessions SET last_activity = ? WHERE session_id = ?`, [Date.now(), sid]);
-        }
+        if (db) await db.execute(`UPDATE sessions SET last_activity = ? WHERE session_id = ?`, [Date.now(), sid]);
         return sessionData.user;
       }
     }
   }
-  
-  if (sid) {
-    const sessionData = sessions.get(sid);
-    if (sessionData) return sessionData.user;
-  }
-  
+  if (sid) { const s = sessions.get(sid); if (s) return s.user; }
   return null;
 }
 
-// ─── P2P Chat Functions ───────────────────────────────────────────────────────
-function getChatRoomId(user1, user2) {
-  return [user1, user2].sort().join(':');
-}
+// ─── P2P Chat ─────────────────────────────────────────────────────────────────
+function getChatRoomId(u1, u2) { return [u1, u2].sort().join(':'); }
 
 async function storeChatMessage(roomId, senderId, recipientId, encryptedContent) {
   if (!db) return;
@@ -334,9 +288,7 @@ async function storeChatMessage(roomId, senderId, recipientId, encryptedContent)
       [messageId, roomId, senderId, recipientId, encryptedContent, Date.now()]
     );
     return messageId;
-  } catch (err) {
-    console.error('❌ Chat storage error:', err.message);
-  }
+  } catch (err) { console.error('❌ Chat storage error:', err.message); }
 }
 
 async function getChatHistory(roomId, limit = 50) {
@@ -344,39 +296,29 @@ async function getChatHistory(roomId, limit = 50) {
   try {
     const messages = await queryMySQL(
       `SELECT id, sender_id, recipient_id, encrypted_content, timestamp, read_at
-       FROM chat_messages
-       WHERE room_id = ?
-       ORDER BY timestamp DESC
-       LIMIT ?`,
+       FROM chat_messages WHERE room_id = ? ORDER BY timestamp DESC LIMIT ?`,
       [roomId, limit]
     );
     return (messages || []).reverse();
-  } catch (err) {
-    console.error('❌ Chat history error:', err.message);
-    return [];
-  }
+  } catch { return []; }
 }
 
 async function markMessagesAsRead(roomId, userId) {
   if (!db) return;
   try {
     await db.execute(
-      `UPDATE chat_messages
-       SET read_at = ?
-       WHERE room_id = ? AND recipient_id = ? AND read_at IS NULL`,
+      `UPDATE chat_messages SET read_at = ? WHERE room_id = ? AND recipient_id = ? AND read_at IS NULL`,
       [Date.now(), roomId, userId]
     );
-  } catch (err) {
-    console.error('❌ Mark read error:', err.message);
-  }
+  } catch (err) { console.error('❌ Mark read error:', err.message); }
 }
 
 // ─── OAuth helpers ────────────────────────────────────────────────────────────
 function postForm(urlString, data) {
   return new Promise((resolve, reject) => {
-    const url = new URL(urlString);
+    const url  = new URL(urlString);
     const body = new URLSearchParams(data).toString();
-    const req = https.request({
+    const req  = https.request({
       method: 'POST', hostname: url.hostname, path: url.pathname + url.search,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {
@@ -402,54 +344,20 @@ function getJson(urlString, headers = {}) {
 
 function decodeJwt(token) {
   try {
-    const payload = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-    return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    return JSON.parse(Buffer.from(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
   } catch { return null; }
 }
 
-// ─── SSR Functions ────────────────────────────────────────────────────────────
-const ssrCache = new Map();
-const SSR_CACHE_TTL = 3_600_000;
+// ─── Bot Detection ────────────────────────────────────────────────────────────
+const BOT_UA = /googlebot|bingbot|yandex|baiduspider|facebookexternalhit|twitterbot|linkedinbot|whatsapp|telegrambot|discordbot|slackbot|applebot|rogerbot|embedly|quora|pinterest|vkshare|w3c_validator/i;
 
-async function fetchPostFromDB(postId) {
-  const escaped = postId.replace(/[%_\\]/g, '\\$&');
-  const rows = await queryMySQL(
-    `SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? OR soul = ? LIMIT 10`,
-    [`v2/%/posts/${escaped}`, '\\', `v2/posts/${postId}`]
-  );
-  if (!rows) return null;
-  for (const row of rows) {
-    try {
-      const d = JSON.parse(row.data);
-      if (d?.title) return {
-        id: d.id || postId, authorName: d.authorName || 'Anonymous',
-        title: d.title, content: d.content || '',
-        imageIPFS: d.imageIPFS || '', createdAt: d.createdAt || Date.now(),
-      };
-    } catch { /* skip */ }
-  }
-  return null;
+function isBot(req) {
+  return BOT_UA.test(req.headers['user-agent'] || '');
 }
 
-async function fetchPollFromDB(pollId) {
-  const escaped = pollId.replace(/[%_\\]/g, '\\$&');
-  const rows = await queryMySQL(
-    `SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? OR soul = ? LIMIT 10`,
-    [`v2/%/polls/${escaped}`, '\\', `v2/polls/${pollId}`]
-  );
-  if (!rows) return null;
-  for (const row of rows) {
-    try {
-      const d = JSON.parse(row.data);
-      if (d?.question) return {
-        id: d.id || pollId, authorName: d.authorName || 'Anonymous',
-        question: d.question, description: d.description || '',
-        totalVotes: d.totalVotes || 0, createdAt: d.createdAt || Date.now(),
-      };
-    } catch { /* skip */ }
-  }
-  return null;
-}
+// ─── SSR Helpers ──────────────────────────────────────────────────────────────
+const ssrCache   = new Map();
+const SSR_CACHE_TTL = 3_600_000; // 1 hour
 
 function escapeHtml(str) {
   if (!str) return '';
@@ -459,7 +367,7 @@ function escapeHtml(str) {
 }
 
 function buildHtmlShell(head, initScript = '') {
-  const ASSET_JS = process.env.ASSET_JS || '/assets2/index.js';
+  const ASSET_JS  = process.env.ASSET_JS  || '/assets2/index.js';
   const ASSET_CSS = process.env.ASSET_CSS || '/assets2/index.css';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -478,65 +386,167 @@ function buildHtmlShell(head, initScript = '') {
 }
 
 function generatePostHTML(post) {
-  const desc = escapeHtml(post.content.slice(0, 160));
-  const title = escapeHtml(post.title);
-  const imageUrl = post.imageIPFS ? `https://ipfs.io/ipfs/${post.imageIPFS}` : `${DOMAIN}/og-default.png`;
-  const postUrl = `${DOMAIN}/post/${post.id}`;
+  const desc     = escapeHtml((post.content || '').replace(/\n/g, ' ').slice(0, 160));
+  const title    = escapeHtml(post.title);
+  const imageUrl = post.imageIPFS
+    ? `https://ipfs.io/ipfs/${post.imageIPFS}`
+    : `${DOMAIN}/og-default.png`;
+  // Always use DOMAIN so canonical URLs are on endless.sbs, not the API server
+  const postUrl  = `${DOMAIN}/community/${post.communityId || 'general'}/post/${post.id}`;
+
   return buildHtmlShell(`
-    <title>${title} - Interpoll</title>
+    <title>${title} — Interpoll</title>
     <meta name="description" content="${desc}" />
-    <meta property="og:type" content="article" />
-    <meta property="og:title" content="${title}" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="${postUrl}" />
+    <meta property="og:type"        content="article" />
+    <meta property="og:site_name"   content="Interpoll" />
+    <meta property="og:title"       content="${title}" />
     <meta property="og:description" content="${desc}" />
-    <meta property="og:image" content="${imageUrl}" />
-    <meta property="og:url" content="${postUrl}" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <link rel="canonical" href="${postUrl}" />`,
+    <meta property="og:image"       content="${imageUrl}" />
+    <meta property="og:url"         content="${postUrl}" />
+    <meta name="twitter:card"        content="summary_large_image" />
+    <meta name="twitter:title"       content="${title}" />
+    <meta name="twitter:description" content="${desc}" />
+    <meta name="twitter:image"       content="${imageUrl}" />
+    <meta property="article:author"          content="${escapeHtml(post.authorName)}" />
+    <meta property="article:published_time"  content="${new Date(post.createdAt).toISOString()}" />`,
     `<script>window.__INITIAL_POST_ID__="${escapeHtml(post.id)}";</script>`
   );
 }
 
 function generatePollHTML(poll) {
-  const desc = escapeHtml((poll.description || `Vote on: ${poll.question}`).slice(0, 160));
+  const desc     = escapeHtml((poll.description || `Vote now: ${poll.question}`).slice(0, 160));
   const question = escapeHtml(poll.question);
-  const pollUrl = `${DOMAIN}/vote/${poll.id}`;
+  const pollUrl  = `${DOMAIN}/community/${poll.communityId || 'general'}/poll/${poll.id}`;
+
   return buildHtmlShell(`
-    <title>${question} - Interpoll</title>
+    <title>${question} — Interpoll</title>
     <meta name="description" content="${desc}" />
-    <meta property="og:type" content="website" />
-    <meta property="og:title" content="${question}" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="${pollUrl}" />
+    <meta property="og:type"        content="website" />
+    <meta property="og:site_name"   content="Interpoll" />
+    <meta property="og:title"       content="${question}" />
     <meta property="og:description" content="${desc}" />
-    <meta property="og:url" content="${pollUrl}" />
-    <link rel="canonical" href="${pollUrl}" />`,
+    <meta property="og:url"         content="${pollUrl}" />
+    <meta name="twitter:card"        content="summary" />
+    <meta name="twitter:title"       content="${question}" />
+    <meta name="twitter:description" content="${desc}" />`,
     `<script>window.__INITIAL_POLL_ID__="${escapeHtml(poll.id)}";</script>`
   );
 }
 
+async function fetchPostFromDB(postId) {
+  const escaped = postId.replace(/[%_\\]/g, '\\$&');
+  const rows    = await queryMySQL(
+    `SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? OR soul = ? LIMIT 10`,
+    [`v2/%/posts/${escaped}`, '\\', `v2/posts/${postId}`]
+  );
+  if (!rows) return null;
+  for (const row of rows) {
+    try {
+      const d = JSON.parse(row.data);
+      if (d?.title) return {
+        id: d.id || postId, communityId: d.communityId || '',
+        authorName: d.authorName || 'Anonymous', title: d.title,
+        content: d.content || '', imageIPFS: d.imageIPFS || '',
+        createdAt: d.createdAt || Date.now(),
+      };
+    } catch { /* skip */ }
+  }
+  return null;
+}
+
+async function fetchPollFromDB(pollId) {
+  const escaped = pollId.replace(/[%_\\]/g, '\\$&');
+  const rows    = await queryMySQL(
+    `SELECT soul, data FROM gun_nodes WHERE soul LIKE ? ESCAPE ? OR soul = ? LIMIT 10`,
+    [`v2/%/polls/${escaped}`, '\\', `v2/polls/${pollId}`]
+  );
+  if (!rows) return null;
+  for (const row of rows) {
+    try {
+      const d = JSON.parse(row.data);
+      if (d?.question) return {
+        id: d.id || pollId, communityId: d.communityId || '',
+        authorName: d.authorName || 'Anonymous', question: d.question,
+        description: d.description || '', totalVotes: d.totalVotes || 0,
+        createdAt: d.createdAt || Date.now(),
+      };
+    } catch { /* skip */ }
+  }
+  return null;
+}
+
+// ─── Sitemap ──────────────────────────────────────────────────────────────────
 async function generateSitemap() {
   try {
-    const rows = await queryMySQL(
-      `SELECT soul, data FROM gun_nodes WHERE soul LIKE 'v2/communities/%/posts/post-%' OR soul LIKE 'v2/polls/poll-%'`,
+    const now = new Date().toISOString().split('T')[0];
+    let xml   = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>${DOMAIN}/</loc><changefreq>hourly</changefreq><priority>1.0</priority></url>
+  <url><loc>${DOMAIN}/search</loc><changefreq>daily</changefreq><priority>0.8</priority></url>\n`;
+
+    // Communities
+    const commRows = await queryMySQL(
+      `SELECT data FROM gun_nodes WHERE soul REGEXP '^v2/communities/c-[^/]+$' LIMIT 500`,
       []
     );
-    const posts = [], polls = [], seen = new Set();
-    for (const row of rows || []) {
+    for (const row of commRows || []) {
       try {
         const d = JSON.parse(row.data);
-        if (!d?.id || seen.has(d.id)) continue;
-        seen.add(d.id);
-        if (row.soul.includes('/posts/')) posts.push({ id: d.id, createdAt: d.createdAt || Date.now() });
-        else if (d.question) polls.push({ id: d.id, createdAt: d.createdAt || Date.now() });
+        if (!d?.id || !d?.displayName) continue;
+        const lastmod = d.createdAt ? new Date(d.createdAt).toISOString().split('T')[0] : now;
+        xml += `  <url><loc>${DOMAIN}/community/${d.id}</loc><lastmod>${lastmod}</lastmod><changefreq>daily</changefreq><priority>0.8</priority></url>\n`;
       } catch { /* skip */ }
     }
-    let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
-    xml += `  <url><loc>${DOMAIN}/</loc><changefreq>hourly</changefreq></url>\n`;
-    for (const p of posts)
-      xml += `  <url><loc>${DOMAIN}/post/${p.id}</loc><lastmod>${new Date(p.createdAt).toISOString().split('T')[0]}</lastmod></url>\n`;
-    for (const p of polls)
-      xml += `  <url><loc>${DOMAIN}/vote/${p.id}</loc><lastmod>${new Date(p.createdAt).toISOString().split('T')[0]}</lastmod></url>\n`;
-    return xml + '</urlset>';
-  } catch {
-    return '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>';
+
+    // Posts — community path matches what SPA actually renders
+    const postRows = await queryMySQL(
+      `SELECT data FROM gun_nodes
+       WHERE soul REGEXP '^v2/communities/[^/]+/posts/post-[^/]+$'
+       ORDER BY JSON_EXTRACT(data, '$.createdAt') DESC
+       LIMIT 2000`,
+      []
+    );
+    const seenPosts = new Set();
+    for (const row of postRows || []) {
+      try {
+        const d = JSON.parse(row.data);
+        if (!d?.id || !d?.title || !d?.communityId || seenPosts.has(d.id)) continue;
+        seenPosts.add(d.id);
+        const lastmod = d.createdAt ? new Date(d.createdAt).toISOString().split('T')[0] : now;
+        xml += `  <url><loc>${DOMAIN}/community/${d.communityId}/post/${d.id}</loc><lastmod>${lastmod}</lastmod><changefreq>weekly</changefreq><priority>0.7</priority></url>\n`;
+      } catch { /* skip */ }
+    }
+
+    // Polls
+    const pollRows = await queryMySQL(
+      `SELECT data FROM gun_nodes
+       WHERE soul REGEXP '^v2/communities/[^/]+/polls/poll-[^/]+$'
+         AND soul NOT REGEXP '/options'
+         AND soul NOT REGEXP '/inviteCodes'
+       ORDER BY JSON_EXTRACT(data, '$.createdAt') DESC
+       LIMIT 1000`,
+      []
+    );
+    const seenPolls = new Set();
+    for (const row of pollRows || []) {
+      try {
+        const d = JSON.parse(row.data);
+        if (!d?.id || !d?.question || !d?.communityId || d?.isPrivate || seenPolls.has(d.id)) continue;
+        seenPolls.add(d.id);
+        const lastmod = d.createdAt ? new Date(d.createdAt).toISOString().split('T')[0] : now;
+        xml += `  <url><loc>${DOMAIN}/community/${d.communityId}/poll/${d.id}</loc><lastmod>${lastmod}</lastmod><changefreq>weekly</changefreq><priority>0.7</priority></url>\n`;
+      } catch { /* skip */ }
+    }
+
+    xml += `</urlset>`;
+    return xml;
+  } catch (err) {
+    console.error('Sitemap error:', err.message);
+    return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>`;
   }
 }
 
@@ -553,10 +563,18 @@ server.on('request', async (req, res) => {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  // ── SSR Routes ────────────────────────────────────────────────────────────
+  // ── SSR Routes (bots only) ────────────────────────────────────────────────
+
   if (req.method === 'GET' && url.pathname.startsWith('/post/')) {
     const postId = url.pathname.split('/')[2];
     if (!postId) { res.writeHead(404); res.end('Not found'); return; }
+
+    // Real users: redirect back to SPA on endless.sbs
+    if (!isBot(req)) {
+      res.writeHead(302, { Location: `${DOMAIN}/post/${postId}` });
+      res.end(); return;
+    }
+
     const cached = ssrCache.get(`post:${postId}`);
     if (cached && Date.now() - cached.ts < SSR_CACHE_TTL) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -575,6 +593,12 @@ server.on('request', async (req, res) => {
   if (req.method === 'GET' && url.pathname.startsWith('/vote/')) {
     const pollId = url.pathname.split('/')[2];
     if (!pollId) { res.writeHead(404); res.end('Not found'); return; }
+
+    if (!isBot(req)) {
+      res.writeHead(302, { Location: `${DOMAIN}/vote/${pollId}` });
+      res.end(); return;
+    }
+
     const cached = ssrCache.get(`poll:${pollId}`);
     if (cached && Date.now() - cached.ts < SSR_CACHE_TTL) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -590,6 +614,86 @@ server.on('request', async (req, res) => {
     res.end(html); return;
   }
 
+  // Community SSR
+  if (req.method === 'GET' && url.pathname.startsWith('/community/')) {
+    const parts       = url.pathname.split('/');
+    const communityId = parts[2];
+    const subtype     = parts[3]; // 'post' or 'poll' or undefined
+    const itemId      = parts[4];
+
+    if (!communityId) { res.writeHead(404); res.end('Not found'); return; }
+
+    if (!isBot(req)) {
+      res.writeHead(302, { Location: `${DOMAIN}${url.pathname}` });
+      res.end(); return;
+    }
+
+    // /community/:id/post/:postId
+    if (subtype === 'post' && itemId) {
+      const cached = ssrCache.get(`post:${itemId}`);
+      if (cached && Date.now() - cached.ts < SSR_CACHE_TTL) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.end(cached.html); return;
+      }
+      const post = await fetchPostFromDB(itemId);
+      if (!post) { res.writeHead(404); res.end('Post not found'); return; }
+      const html = generatePostHTML(post);
+      ssrCache.set(`post:${itemId}`, { html, ts: Date.now() });
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+      res.end(html); return;
+    }
+
+    // /community/:id/poll/:pollId
+    if ((subtype === 'poll' || subtype === 'vote') && itemId) {
+      const cached = ssrCache.get(`poll:${itemId}`);
+      if (cached && Date.now() - cached.ts < SSR_CACHE_TTL) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.end(cached.html); return;
+      }
+      const poll = await fetchPollFromDB(itemId);
+      if (!poll) { res.writeHead(404); res.end('Poll not found'); return; }
+      const html = generatePollHTML(poll);
+      ssrCache.set(`poll:${itemId}`, { html, ts: Date.now() });
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+      res.end(html); return;
+    }
+
+    // /community/:id  — community page
+    const commRows = await queryMySQL(
+      `SELECT data FROM gun_nodes WHERE soul = ? LIMIT 1`,
+      [`v2/communities/${communityId}`]
+    );
+    let commHtml = '';
+    if (commRows?.length) {
+      try {
+        const d    = JSON.parse(commRows[0].data);
+        const name = escapeHtml(d.displayName || communityId);
+        const desc = escapeHtml((d.description || '').slice(0, 160));
+        const commUrl = `${DOMAIN}/community/${communityId}`;
+        commHtml = buildHtmlShell(`
+          <title>${name} — Interpoll</title>
+          <meta name="description" content="${desc}" />
+          <meta name="robots" content="index, follow" />
+          <link rel="canonical" href="${commUrl}" />
+          <meta property="og:title" content="${name}" />
+          <meta property="og:description" content="${desc}" />
+          <meta property="og:url" content="${commUrl}" />
+          <meta property="og:type" content="website" />`
+        );
+      } catch { /* fall through */ }
+    }
+    if (!commHtml) {
+      commHtml = buildHtmlShell(`<title>Community — Interpoll</title>`);
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=1800');
+    res.end(commHtml); return;
+  }
+
   // ── Search API ────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/api/search') {
     const query = url.searchParams.get('q');
@@ -598,14 +702,12 @@ server.on('request', async (req, res) => {
       res.end(JSON.stringify({ error: 'Query must be at least 2 characters' }));
       return;
     }
-    
     const filters = {
-      type: url.searchParams.get('type'),
+      type:      url.searchParams.get('type'),
       community: url.searchParams.get('community'),
-      limit: url.searchParams.get('limit'),
-      offset: url.searchParams.get('offset'),
+      limit:     url.searchParams.get('limit'),
+      offset:    url.searchParams.get('offset'),
     };
-    
     const results = await searchContent(query, filters);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(results));
@@ -621,8 +723,7 @@ server.on('request', async (req, res) => {
         const { type, id, data } = JSON.parse(body || '{}');
         if (!type || !id || !data) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Missing required fields' }));
-          return;
+          res.end(JSON.stringify({ error: 'Missing required fields' })); return;
         }
         await indexContent(type, id, data);
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -632,31 +733,25 @@ server.on('request', async (req, res) => {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Indexing failed' }));
       }
-    });
-    return;
+    }); return;
   }
 
   // ── Chat History ──────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/api/chat/history') {
     const user = await getSecureSession(req);
     if (!user) { res.writeHead(401); res.end('Unauthorized'); return; }
-    
     const otherUserId = url.searchParams.get('userId');
     if (!otherUserId) { res.writeHead(400); res.end('Missing userId'); return; }
-    
-    const roomId = getChatRoomId(user.sub, otherUserId);
+    const roomId   = getChatRoomId(user.sub, otherUserId);
     const messages = await getChatHistory(roomId, 100);
-    
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ messages }));
-    return;
+    res.end(JSON.stringify({ messages })); return;
   }
 
   // ── Mark messages as read ─────────────────────────────────────────────────
   if (req.method === 'POST' && url.pathname === '/api/chat/mark-read') {
     const user = await getSecureSession(req);
     if (!user) { res.writeHead(401); res.end('Unauthorized'); return; }
-    
     let body = '';
     req.on('data', chunk => body += chunk.toString());
     req.on('end', async () => {
@@ -666,20 +761,18 @@ server.on('request', async (req, res) => {
         await markMessagesAsRead(roomId, user.sub);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
-      } catch {
-        res.writeHead(500); res.end('Error');
-      }
-    });
-    return;
+      } catch { res.writeHead(500); res.end('Error'); }
+    }); return;
   }
 
-  // ── Sitemap & Robots ──────────────────────────────────────────────────────
+  // ── Sitemap ───────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/sitemap.xml') {
     res.setHeader('Content-Type', 'application/xml');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
     res.end(await generateSitemap()); return;
   }
 
+  // ── Robots ────────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/robots.txt') {
     res.setHeader('Content-Type', 'text/plain');
     res.end(`User-agent: *\nAllow: /\nDisallow: /auth/\nDisallow: /api/\nSitemap: ${DOMAIN}/sitemap.xml\n`);
@@ -689,20 +782,17 @@ server.on('request', async (req, res) => {
   // ── Health ────────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
-      status: 'ok', 
-      uptime: process.uptime(), 
-      clients: clients.size, 
-      activeChatRooms: activeChatSessions.size,
-      cachedMessages: messageCache.length, 
-      mysql: !!db 
-    }));
-    return;
+    res.end(JSON.stringify({
+      status: 'ok', uptime: process.uptime(),
+      clients: clients.size, activeChatRooms: activeChatSessions.size,
+      cachedMessages: messageCache.length, mysql: !!db,
+      ssrCacheSize: ssrCache.size,
+    })); return;
   }
 
   // ── Google OAuth ──────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/auth/google/start') {
-    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientId    = process.env.GOOGLE_CLIENT_ID;
     const redirectUri = `${process.env.SERVER_ORIGIN || `http://localhost:${PORT}`}/auth/google/callback`;
     if (!clientId) { res.writeHead(500); res.end('Google OAuth not configured'); return; }
     const state = generateSecureToken(16);
@@ -719,7 +809,7 @@ server.on('request', async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/auth/google/callback') {
-    const code = url.searchParams.get('code');
+    const code  = url.searchParams.get('code');
     const state = url.searchParams.get('state');
     if (!code || !state || oauthStates.get(state) !== 'google') {
       res.writeHead(400); res.end('Invalid OAuth state'); return;
@@ -747,14 +837,14 @@ server.on('request', async (req, res) => {
           res.writeHead(302, { Location: `${FRONTEND_ORIGIN}/auth/callback?sessionId=${sessionId}` });
           res.end();
         });
-    }).catch((err) => { console.error('Google OAuth error:', err); res.writeHead(500); res.end('Google OAuth failed'); });
+    }).catch(err => { console.error('Google OAuth error:', err); res.writeHead(500); res.end('Google OAuth failed'); });
     return;
   }
 
   // ── Microsoft OAuth ───────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/auth/microsoft/start') {
-    const clientId = process.env.MS_CLIENT_ID;
-    const tenant = process.env.MS_TENANT || 'common';
+    const clientId    = process.env.MS_CLIENT_ID;
+    const tenant      = process.env.MS_TENANT || 'common';
     const redirectUri = `${process.env.SERVER_ORIGIN || `http://localhost:${PORT}`}/auth/microsoft/callback`;
     if (!clientId) { res.writeHead(500); res.end('Microsoft OAuth not configured'); return; }
     const state = generateSecureToken(16);
@@ -771,13 +861,13 @@ server.on('request', async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/auth/microsoft/callback') {
-    const code = url.searchParams.get('code');
+    const code  = url.searchParams.get('code');
     const state = url.searchParams.get('state');
     if (!code || !state || oauthStates.get(state) !== 'microsoft') {
       res.writeHead(400); res.end('Invalid OAuth state'); return;
     }
     oauthStates.delete(state);
-    const tenant = process.env.MS_TENANT || 'common';
+    const tenant      = process.env.MS_TENANT || 'common';
     const redirectUri = `${process.env.SERVER_ORIGIN || `http://localhost:${PORT}`}/auth/microsoft/callback`;
     postForm(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`, {
       client_id: process.env.MS_CLIENT_ID || '', client_secret: process.env.MS_CLIENT_SECRET || '',
@@ -790,7 +880,7 @@ server.on('request', async (req, res) => {
       const { sessionId } = await setSecureSession(res, req, user);
       res.writeHead(302, { Location: `${FRONTEND_ORIGIN}/auth/callback?sessionId=${sessionId}` });
       res.end();
-    }).catch((err) => { console.error('Microsoft OAuth error:', err); res.writeHead(500); res.end('Microsoft OAuth failed'); });
+    }).catch(err => { console.error('Microsoft OAuth error:', err); res.writeHead(500); res.end('Microsoft OAuth failed'); });
     return;
   }
 
@@ -803,16 +893,14 @@ server.on('request', async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/auth/logout') {
     const cookie = req.headers['cookie'] || '';
-    const sid = cookie.split(';').find(c => c.trim().startsWith('sessionId='))?.split('=')[1];
+    const sid    = cookie.split(';').find(c => c.trim().startsWith('sessionId='))?.split('=')[1];
     if (sid) {
       sessions.delete(sid);
-      if (db) {
-        await db.execute(`DELETE FROM sessions WHERE session_id = ?`, [sid]);
-      }
+      if (db) await db.execute(`DELETE FROM sessions WHERE session_id = ?`, [sid]);
     }
     res.setHeader('Set-Cookie', [
       'sessionId=; HttpOnly; Path=/; SameSite=None; Secure; Max-Age=0',
-      'jwt=; Path=/; SameSite=None; Secure; Max-Age=0'
+      'jwt=; Path=/; SameSite=None; Secure; Max-Age=0',
     ]);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true })); return;
@@ -829,7 +917,7 @@ server.on('request', async (req, res) => {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ allowed: false, reason: 'missing pollId or deviceId' })); return;
         }
-        const key = `${pollId}:${deviceId}`;
+        const key          = `${pollId}:${deviceId}`;
         const alreadyVoted = voteRegistry.has(key);
         if (!alreadyVoted) voteRegistry.add(key);
         fs.appendFile(RECEIPT_LOG_FILE, JSON.stringify({ type: 'vote-authorize', pollId, deviceId, allowed: !alreadyVoted, timestamp: Date.now() }) + '\n', () => {});
@@ -864,7 +952,7 @@ server.on('request', async (req, res) => {
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 const PING_INTERVAL = 20_000;
-const pingTimer = setInterval(() => {
+const pingTimer     = setInterval(() => {
   wss.clients.forEach(ws => {
     if (ws.isAlive === false) { ws.terminate(); return; }
     ws.isAlive = false;
@@ -874,7 +962,7 @@ const pingTimer = setInterval(() => {
 
 wss.on('close', () => clearInterval(pingTimer));
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
   let peerId = null;
   let userId = null;
   ws.isAlive = true;
@@ -883,14 +971,13 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message.toString());
-      
       switch (data.type) {
+
         case 'register':
           peerId = data.peerId;
           userId = data.userId;
           clients.set(peerId, { ws, userId, peerId });
           broadcast({ type: 'peer-list', peers: Array.from(clients.keys()) });
-          
           for (const msg of messageCache) {
             try { ws.send(JSON.stringify(msg)); } catch { /* ignore */ }
           }
@@ -903,45 +990,30 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── P2P Chat ──────────────────────────────────────────────────────────
         case 'chat-start': {
           const recipientId = data.recipientId;
-          const roomId = getChatRoomId(userId, recipientId);
+          const roomId      = getChatRoomId(userId, recipientId);
           activeChatSessions.set(roomId, { users: [userId, recipientId], createdAt: Date.now() });
-          
           const recipientClient = Array.from(clients.values()).find(c => c.userId === recipientId);
           if (recipientClient?.ws.readyState === 1) {
-            recipientClient.ws.send(JSON.stringify({
-              type: 'chat-invite',
-              from: userId,
-              roomId,
-            }));
+            recipientClient.ws.send(JSON.stringify({ type: 'chat-invite', from: userId, roomId }));
           }
           break;
         }
 
         case 'chat-message': {
           const { recipientId, encryptedForRecipient, messageId, timestamp } = data;
-          const roomId = getChatRoomId(userId, recipientId);
-          
+          const roomId   = getChatRoomId(userId, recipientId);
           const storedId = await storeChatMessage(roomId, userId, recipientId, encryptedForRecipient);
-          
           const recipientClient = Array.from(clients.values()).find(c => c.userId === recipientId);
           if (recipientClient?.ws.readyState === 1) {
             recipientClient.ws.send(JSON.stringify({
-  type: 'chat-message',
-  from: userId,
-  messageId: storedId || messageId,
-  encryptedForRecipient,
-  timestamp: timestamp || Date.now(),
-}));
+              type: 'chat-message', from: userId,
+              messageId: storedId || messageId, encryptedForRecipient,
+              timestamp: timestamp || Date.now(),
+            }));
           }
-          
-          ws.send(JSON.stringify({
-            type: 'chat-delivered',
-            messageId: storedId || messageId,
-            recipientId,
-          }));
+          ws.send(JSON.stringify({ type: 'chat-delivered', messageId: storedId || messageId, recipientId }));
           break;
         }
 
@@ -949,11 +1021,7 @@ wss.on('connection', (ws, req) => {
           const { recipientId, isTyping } = data;
           const recipientClient = Array.from(clients.values()).find(c => c.userId === recipientId);
           if (recipientClient?.ws.readyState === 1) {
-            recipientClient.ws.send(JSON.stringify({
-              type: 'chat-typing',
-              from: userId,
-              isTyping,
-            }));
+            recipientClient.ws.send(JSON.stringify({ type: 'chat-typing', from: userId, isTyping }));
           }
           break;
         }
@@ -962,13 +1030,9 @@ wss.on('connection', (ws, req) => {
           const { recipientId } = data;
           const roomId = getChatRoomId(userId, recipientId);
           await markMessagesAsRead(roomId, userId);
-          
           const senderClient = Array.from(clients.values()).find(c => c.userId === recipientId);
           if (senderClient?.ws.readyState === 1) {
-            senderClient.ws.send(JSON.stringify({
-              type: 'chat-read-receipt',
-              from: userId,
-            }));
+            senderClient.ws.send(JSON.stringify({ type: 'chat-read-receipt', from: userId }));
           }
           break;
         }
@@ -990,19 +1054,13 @@ wss.on('connection', (ws, req) => {
         case 'sync-response':
           broadcastToOthers(peerId, data);
           cacheMessage(data);
-          
-          if (data.type === 'new-poll' && data.poll) {
-            await indexContent('poll', data.poll.id, data.poll);
-          }
+          if (data.type === 'new-poll' && data.poll) await indexContent('poll', data.poll.id, data.poll);
           break;
 
         case 'new-post':
           broadcastToOthers(peerId, data);
           cacheMessage(data);
-          
-          if (data.post) {
-            await indexContent('post', data.post.id, data.post);
-          }
+          if (data.post) await indexContent('post', data.post.id, data.post);
           break;
 
         case 'ping':
@@ -1020,11 +1078,8 @@ wss.on('connection', (ws, req) => {
         if (peers.size === 0) rooms.delete(roomId);
       });
       broadcast({ type: 'peer-left', peerId });
-      
       activeChatSessions.forEach((session, roomId) => {
-        if (session.users.includes(userId)) {
-          activeChatSessions.delete(roomId);
-        }
+        if (session.users.includes(userId)) activeChatSessions.delete(roomId);
       });
     }
   });
@@ -1038,27 +1093,33 @@ function broadcast(msg) {
 }
 
 function broadcastToOthers(excludeId, msg) {
-  clients.forEach(({ ws, peerId }) => { 
-    if (peerId !== excludeId && ws.readyState === 1) ws.send(JSON.stringify(msg)); 
+  clients.forEach(({ ws, peerId }) => {
+    if (peerId !== excludeId && ws.readyState === 1) ws.send(JSON.stringify(msg));
   });
 }
 
-// ─── Cleanup old sessions ─────────────────────────────────────────────────────
+// ─── Cleanup ──────────────────────────────────────────────────────────────────
 setInterval(async () => {
   if (!db) return;
-  try {
-    await db.execute(`DELETE FROM sessions WHERE expires_at < ?`, [Date.now()]);
-  } catch (err) {
-    console.error('Session cleanup error:', err.message);
+  try { await db.execute(`DELETE FROM sessions WHERE expires_at < ?`, [Date.now()]); }
+  catch (err) { console.error('Session cleanup error:', err.message); }
+}, 3_600_000);
+
+// Evict stale SSR cache entries every 2 hours
+setInterval(() => {
+  const cutoff = Date.now() - SSR_CACHE_TTL;
+  for (const [key, val] of ssrCache) {
+    if (val.ts < cutoff) ssrCache.delete(key);
   }
-}, 3600_000);
+}, 7_200_000);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`🚀 Enhanced Relay on :${PORT}`);
-  console.log(`   MySQL: ${db ? '✅' : '❌'}`);
-  console.log(`   Features: P2P Chat ✅ | Search ✅ | Enhanced Auth ✅`);
-  console.log(`   Cache: ${messageCache.length} messages`);
+  console.log(`   Domain : ${DOMAIN}`);
+  console.log(`   MySQL  : ${db ? '✅' : '❌'}`);
+  console.log(`   Features: P2P Chat ✅ | Search ✅ | Auth ✅ | SSR ✅ | Sitemap ✅`);
+  console.log(`   Cache  : ${messageCache.length} messages`);
 });
 
 process.on('SIGINT', () => {
@@ -1067,4 +1128,3 @@ process.on('SIGINT', () => {
   wss.clients.forEach(ws => ws.close());
   server.close(() => process.exit(0));
 });
-
